@@ -9,3 +9,7 @@
 2. 環境変数 `(OLD|NEW)_AWS_REGION` と `(OLD|NEW)_AWS_ENDPOINT_URL` を `.env.local` に定義
 3. `wasabi`等を使う際にバケット名の重複を回避したい場合には、`NEW_BUCKET_SUFFIX`を設定
 4. `task` で実行
+
+## 注意事項
+
+- 移行できるオブジェクト数は1バケット当たり `1,000,000` 個まで

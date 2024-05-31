@@ -8,6 +8,8 @@ use aws_sdk_s3::{
     Client,
 };
 
+const MAX_KEYS: i32 = 1000000;
+
 async fn get_client(
     env_config_files: EnvConfigFiles,
     region: Region,
@@ -100,7 +102,8 @@ async fn main() {
         println!("New Bucket: {}", new_bucket_name);
 
         let mut migrated_objects = new_client
-            .list_objects()
+            .list_objects_v2()
+            .max_keys(MAX_KEYS)
             .bucket(&new_bucket_name)
             .send()
             .await
@@ -114,6 +117,7 @@ async fn main() {
 
         let mut objects = old_client
             .list_objects()
+            .max_keys(MAX_KEYS)
             .bucket(bucket_name)
             .send()
             .await
