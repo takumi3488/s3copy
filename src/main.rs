@@ -2,7 +2,11 @@ use std::env;
 
 use aws_config::Region;
 use aws_runtime::env_config::file::{EnvConfigFileKind, EnvConfigFiles};
-use aws_sdk_s3::{config::Builder, Client};
+use aws_sdk_s3::{
+    config::Builder,
+    types::{BucketLocationConstraint, CreateBucketConfiguration, Object},
+    Client,
+};
 
 async fn get_client(
     env_config_files: EnvConfigFiles,
@@ -71,18 +75,73 @@ async fn main() {
         let bucket_name = bucket.name.as_deref().unwrap();
         println!("Bucket: {}", bucket_name);
 
-        let objects = old_client
+        let mut new_bucket_name = bucket_name.to_string();
+
+        if let Err(e) = new_client
+            .create_bucket()
+            .bucket(&new_bucket_name)
+            .send()
+            .await
+        {
+            if format!("{:?}", e).contains("BucketAlreadyExists") {
+                new_bucket_name += &env::var("NEW_BUCKET_SUFFIX").expect(
+                    "NEW_BUCKET_SUFFIX must be set to avoid conflicts with existing buckets",
+                );
+                let _ = new_client
+                    .create_bucket()
+                    .bucket(&new_bucket_name)
+                    .send()
+                    .await;
+            } else {
+                panic!("{:?}", e);
+            }
+        }
+
+        println!("New Bucket: {}", new_bucket_name);
+
+        let mut migrated_objects = new_client
+            .list_objects()
+            .bucket(&new_bucket_name)
+            .send()
+            .await
+            .unwrap()
+            .contents
+            .unwrap_or(vec![])
+            .iter()
+            .map(|object| object.key.clone().unwrap())
+            .collect::<Vec<String>>();
+        migrated_objects.sort_unstable();
+
+        let mut objects = old_client
             .list_objects()
             .bucket(bucket_name)
             .send()
             .await
             .unwrap()
             .contents
-            .unwrap();
+            .unwrap_or(vec![]);
+        objects = objects
+            .iter()
+            .filter(|&object| {
+                migrated_objects
+                    .binary_search(&object.key.clone().unwrap())
+                    .is_err()
+            })
+            .cloned()
+            .collect::<Vec<Object>>();
 
+        let constraint = BucketLocationConstraint::from(
+            env::var("NEW_AWS_REGION")
+                .unwrap_or("us-east-1".to_string())
+                .as_str(),
+        );
+        let bucket_config = CreateBucketConfiguration::builder()
+            .location_constraint(constraint)
+            .build();
         let _ = new_client
             .create_bucket()
-            .bucket(bucket_name)
+            .create_bucket_configuration(bucket_config)
+            .bucket(&new_bucket_name)
             .send()
             .await;
 
@@ -100,7 +159,7 @@ async fn main() {
 
             new_client
                 .put_object()
-                .bucket(bucket_name)
+                .bucket(&new_bucket_name)
                 .key(object_key)
                 .body(object.body.into())
                 .send()
