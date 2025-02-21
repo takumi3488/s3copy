@@ -94,7 +94,7 @@ async fn main() {
                     .bucket(&new_bucket_name)
                     .send()
                     .await;
-            } else {
+            } else if !format!("{:?}", e).contains("BucketAlreadyOwnedByYou") {
                 panic!("{:?}", e);
             }
         }
