@@ -10,3 +10,6 @@ tasks:
   run:release:
     cmds:
       - cargo run --release
+  delete:
+    cmds:
+      - cargo run --bin delete --release
