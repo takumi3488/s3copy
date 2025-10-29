@@ -1,7 +1,9 @@
-use std::{collections::HashSet, env, mem::take};
+use std::{collections::HashSet, env, mem::take, time::Duration};
 
-use anyhow::Result;
-use aws_config::{retry::RetryConfig, Region};
+use anyhow::{Context, Result};
+use aws_config::{
+    retry::RetryConfig, stalled_stream_protection::StalledStreamProtectionConfig, Region,
+};
 use aws_runtime::env_config::file::{EnvConfigFileKind, EnvConfigFiles};
 use aws_sdk_s3::{
     config::Builder,
@@ -24,7 +26,12 @@ async fn get_client(
     let mut config_loader = aws_config::from_env()
         .profile_files(env_config_files)
         .region(region)
-        .retry_config(RetryConfig::standard().with_max_attempts(u32::MAX));
+        .retry_config(RetryConfig::standard().with_max_attempts(u32::MAX))
+        .stalled_stream_protection(
+            StalledStreamProtectionConfig::enabled()
+                .grace_period(Duration::from_secs(60))
+                .build(),
+        );
     config_loader = match endpoint_url {
         Some(url) => config_loader.endpoint_url(url),
         None => config_loader,
@@ -200,20 +207,30 @@ async fn multipart_upload(
     object_key: &str,
     mut object: GetObjectOutput,
 ) -> Result<()> {
+    eprintln!("Starting multipart upload for: {}", object_key);
+
     let multipart_upload_res = client
         .create_multipart_upload()
         .bucket(bucket_name)
         .key(object_key)
         .send()
         .await
-        .unwrap();
-    let upload_id = multipart_upload_res.upload_id.unwrap();
+        .with_context(|| format!("Failed to create multipart upload for {}", object_key))?;
+
+    let upload_id = multipart_upload_res
+        .upload_id
+        .with_context(|| format!("Missing upload_id for {}", object_key))?;
 
     let mut part = vec![];
     let mut part_number = 0;
     let mut upload_tasks = vec![];
 
-    while let Some(bytes) = object.body.try_next().await.unwrap() {
+    while let Some(bytes) = object
+        .body
+        .try_next()
+        .await
+        .with_context(|| format!("Failed to read object body stream for {}", object_key))?
+    {
         part.extend_from_slice(&bytes);
         if part.len() >= CHUNK_SIZE {
             part_number += 1;
@@ -258,14 +275,21 @@ async fn multipart_upload(
         upload_tasks.push(task);
     }
 
-    let completed_uploads = futures::future::try_join_all(upload_tasks)
+    let upload_results = futures::future::try_join_all(upload_tasks)
         .await
-        .unwrap()
+        .with_context(|| format!("Failed to join upload tasks for {}", object_key))?;
+
+    let completed_uploads: Vec<CompletedPart> = upload_results
         .iter()
         .enumerate()
         .map(|(i, res)| {
+            let e_tag = res
+                .as_ref()
+                .ok()
+                .and_then(|r| r.e_tag())
+                .unwrap_or_default();
             CompletedPart::builder()
-                .e_tag(res.as_ref().unwrap().e_tag().unwrap_or_default())
+                .e_tag(e_tag)
                 .part_number(i as i32 + 1)
                 .build()
         })
@@ -283,7 +307,12 @@ async fn multipart_upload(
         )
         .send()
         .await
-        .unwrap();
+        .with_context(|| format!("Failed to complete multipart upload for {}", object_key))?;
+
+    eprintln!(
+        "Successfully completed multipart upload for: {}",
+        object_key
+    );
 
     Ok(())
 }
