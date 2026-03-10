@@ -1,5 +1,6 @@
 use std::{collections::HashSet, env};
 
+use anyhow::{Context, Result};
 use aws_config::{retry::RetryConfig, Region};
 use aws_runtime::env_config::file::{EnvConfigFileKind, EnvConfigFiles};
 use aws_sdk_s3::{config::Builder, Client};
@@ -33,14 +34,14 @@ fn region_from_str(region: &str) -> Region {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let old_client = get_client(
         EnvConfigFiles::builder()
             .with_file(EnvConfigFileKind::Credentials, ".old.credentials")
             .build(),
         region_from_str(
             env::var("OLD_AWS_REGION")
-                .unwrap_or("us-east-1".to_string())
+                .unwrap_or_else(|_| "us-east-1".to_string())
                 .as_str(),
         ),
         env::var("OLD_AWS_ENDPOINT_URL").ok().as_deref(),
@@ -51,7 +52,7 @@ async fn main() {
         .list_buckets()
         .send()
         .await
-        .unwrap()
+        .context("Failed to list buckets")?
         .buckets
         .unwrap_or_default()
     {
@@ -63,7 +64,7 @@ async fn main() {
             .bucket(bucket_name)
             .send()
             .await
-            .unwrap();
+            .context("Failed to list objects")?;
 
         for object in list_objects_output.contents.unwrap_or_default() {
             objects.insert(object.key.as_deref().unwrap_or_default().to_string());
@@ -76,7 +77,7 @@ async fn main() {
                 .marker(next_marker)
                 .send()
                 .await
-                .unwrap();
+                .context("Failed to list objects with marker")?;
 
             for object in list_objects_output.contents.unwrap_or_default() {
                 objects.insert(object.key.as_deref().unwrap_or_default().to_string());
@@ -84,7 +85,7 @@ async fn main() {
         }
 
         for object in objects {
-            println!("Deleting object: {}", object);
+            println!("Deleting object: {object}");
 
             old_client
                 .delete_object()
@@ -92,7 +93,7 @@ async fn main() {
                 .key(&object)
                 .send()
                 .await
-                .unwrap();
+                .context("Failed to delete object")?;
         }
 
         old_client
@@ -100,6 +101,8 @@ async fn main() {
             .bucket(bucket_name)
             .send()
             .await
-            .unwrap();
+            .context("Failed to delete bucket")?;
     }
+
+    Ok(())
 }
