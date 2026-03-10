@@ -15,7 +15,7 @@ use aws_sdk_s3::{
     Client,
 };
 
-const MAX_KEYS: i32 = 1000000;
+const MAX_KEYS: i32 = 1_000_000;
 const CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5MB
 
 async fn get_client(
@@ -51,15 +51,127 @@ fn region_from_str(region: &str) -> Region {
     }
 }
 
+async fn resolve_new_bucket_name(
+    new_client: &Client,
+    bucket_name: &str,
+) -> Result<String> {
+    let mut new_bucket_name = bucket_name.to_string();
+
+    if let Err(e) = new_client
+        .create_bucket()
+        .bucket(&new_bucket_name)
+        .send()
+        .await
+    {
+        if format!("{e:?}").contains("BucketAlreadyExists") {
+            new_bucket_name += &env::var("NEW_BUCKET_SUFFIX").context(
+                "NEW_BUCKET_SUFFIX must be set to avoid conflicts with existing buckets",
+            )?;
+            let _ = new_client
+                .create_bucket()
+                .bucket(&new_bucket_name)
+                .send()
+                .await;
+        } else if !format!("{e:?}").contains("BucketAlreadyOwnedByYou") {
+            return Err(e.into());
+        }
+    }
+
+    Ok(new_bucket_name)
+}
+
+async fn migrate_bucket(
+    old_client: &Client,
+    new_client: &Client,
+    bucket_name: &str,
+) -> Result<()> {
+    println!("Bucket: {bucket_name}");
+
+    let new_bucket_name = resolve_new_bucket_name(new_client, bucket_name).await?;
+    println!("New Bucket: {new_bucket_name}");
+
+    let migrated_objects: HashSet<String> = new_client
+        .list_objects_v2()
+        .max_keys(MAX_KEYS)
+        .bucket(&new_bucket_name)
+        .send()
+        .await
+        .context("Failed to list objects in new bucket")?
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|object| object.key)
+        .collect();
+
+    let mut objects = old_client
+        .list_objects()
+        .max_keys(MAX_KEYS)
+        .bucket(bucket_name)
+        .send()
+        .await
+        .context("Failed to list objects in old bucket")?
+        .contents
+        .unwrap_or_default();
+    objects = objects
+        .into_iter()
+        .filter(|object| {
+            object
+                .key
+                .as_deref()
+                .is_some_and(|k| !migrated_objects.contains(k))
+        })
+        .collect::<Vec<Object>>();
+
+    let constraint = BucketLocationConstraint::from(
+        env::var("NEW_AWS_REGION")
+            .unwrap_or_else(|_| "us-east-1".to_string())
+            .as_str(),
+    );
+    let bucket_config = CreateBucketConfiguration::builder()
+        .location_constraint(constraint)
+        .build();
+    let _ = new_client
+        .create_bucket()
+        .create_bucket_configuration(bucket_config)
+        .bucket(&new_bucket_name)
+        .send()
+        .await;
+
+    for object in objects {
+        let object_key = object.key.as_deref().context("Object key is None")?;
+        println!("Object: {object_key}");
+
+        let object = old_client
+            .get_object()
+            .bucket(bucket_name)
+            .key(object_key)
+            .send()
+            .await
+            .context("Failed to get object")?;
+
+        if object.content_length().unwrap_or(0) < 5 * 1024 * 1024 {
+            singlepart_upload(new_client, &new_bucket_name, object_key, object)
+                .await
+                .context("Singlepart upload failed")?;
+        } else {
+            multipart_upload(new_client, &new_bucket_name, object_key, object)
+                .await
+                .context("Multipart upload failed")?;
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let old_client = get_client(
         EnvConfigFiles::builder()
             .with_file(EnvConfigFileKind::Credentials, ".old.credentials")
             .build(),
         region_from_str(
             env::var("OLD_AWS_REGION")
-                .unwrap_or("us-east-1".to_string())
+                .unwrap_or_else(|_| "us-east-1".to_string())
                 .as_str(),
         ),
         env::var("OLD_AWS_ENDPOINT_URL").ok().as_deref(),
@@ -72,7 +184,7 @@ async fn main() {
             .build(),
         region_from_str(
             env::var("NEW_AWS_REGION")
-                .unwrap_or("us-east-1".to_string())
+                .unwrap_or_else(|_| "us-east-1".to_string())
                 .as_str(),
         ),
         env::var("NEW_AWS_ENDPOINT_URL").ok().as_deref(),
@@ -83,106 +195,17 @@ async fn main() {
         .list_buckets()
         .send()
         .await
-        .unwrap()
+        .context("Failed to list buckets")?
         .buckets
-        .unwrap();
+        .unwrap_or_default();
 
     for bucket in buckets {
-        let bucket_name = bucket.name.as_deref().unwrap();
-        println!("Bucket: {}", bucket_name);
-
-        let mut new_bucket_name = bucket_name.to_string();
-
-        if let Err(e) = new_client
-            .create_bucket()
-            .bucket(&new_bucket_name)
-            .send()
-            .await
-        {
-            if format!("{:?}", e).contains("BucketAlreadyExists") {
-                new_bucket_name += &env::var("NEW_BUCKET_SUFFIX").expect(
-                    "NEW_BUCKET_SUFFIX must be set to avoid conflicts with existing buckets",
-                );
-                let _ = new_client
-                    .create_bucket()
-                    .bucket(&new_bucket_name)
-                    .send()
-                    .await;
-            } else if !format!("{:?}", e).contains("BucketAlreadyOwnedByYou") {
-                panic!("{:?}", e);
-            }
-        }
-
-        println!("New Bucket: {}", new_bucket_name);
-
-        let migrated_objects: HashSet<String> = new_client
-            .list_objects_v2()
-            .max_keys(MAX_KEYS)
-            .bucket(&new_bucket_name)
-            .send()
-            .await
-            .unwrap()
-            .contents
-            .unwrap_or(vec![])
-            .iter()
-            .map(|object| object.key.clone().unwrap())
-            .collect();
-
-        let mut objects = old_client
-            .list_objects()
-            .max_keys(MAX_KEYS)
-            .bucket(bucket_name)
-            .send()
-            .await
-            .unwrap()
-            .contents
-            .unwrap_or(vec![]);
-        objects = objects
-            .iter()
-            .filter(|&object| !migrated_objects.contains(&object.key.clone().unwrap()))
-            .cloned()
-            .collect::<Vec<Object>>();
-
-        let constraint = BucketLocationConstraint::from(
-            env::var("NEW_AWS_REGION")
-                .unwrap_or("us-east-1".to_string())
-                .as_str(),
-        );
-        let bucket_config = CreateBucketConfiguration::builder()
-            .location_constraint(constraint)
-            .build();
-        let _ = new_client
-            .create_bucket()
-            .create_bucket_configuration(bucket_config)
-            .bucket(&new_bucket_name)
-            .send()
-            .await;
-
-        for object in objects {
-            let object_key = object.key.as_deref().unwrap();
-            println!("Object: {}", object_key);
-
-            let object = old_client
-                .get_object()
-                .bucket(bucket_name)
-                .key(object_key)
-                .send()
-                .await
-                .unwrap();
-
-            if object.content_length().unwrap_or(0) < CHUNK_SIZE as i64 {
-                singlepart_upload(&new_client, &new_bucket_name, object_key, object)
-                    .await
-                    .unwrap();
-            } else {
-                multipart_upload(&new_client, &new_bucket_name, object_key, object)
-                    .await
-                    .unwrap();
-            }
-        }
+        let bucket_name = bucket.name.as_deref().unwrap_or_default();
+        migrate_bucket(&old_client, &new_client, bucket_name).await?;
     }
 
     println!("Done!");
+    Ok(())
 }
 
 async fn singlepart_upload(
@@ -207,7 +230,7 @@ async fn multipart_upload(
     object_key: &str,
     mut object: GetObjectOutput,
 ) -> Result<()> {
-    eprintln!("Starting multipart upload for: {}", object_key);
+    eprintln!("Starting multipart upload for: {object_key}");
 
     let multipart_upload_res = client
         .create_multipart_upload()
@@ -215,11 +238,11 @@ async fn multipart_upload(
         .key(object_key)
         .send()
         .await
-        .with_context(|| format!("Failed to create multipart upload for {}", object_key))?;
+        .with_context(|| format!("Failed to create multipart upload for {object_key}"))?;
 
     let upload_id = multipart_upload_res
         .upload_id
-        .with_context(|| format!("Missing upload_id for {}", object_key))?;
+        .with_context(|| format!("Missing upload_id for {object_key}"))?;
 
     let mut part = vec![];
     let mut part_number = 0;
@@ -229,7 +252,7 @@ async fn multipart_upload(
         .body
         .try_next()
         .await
-        .with_context(|| format!("Failed to read object body stream for {}", object_key))?
+        .with_context(|| format!("Failed to read object body stream for {object_key}"))?
     {
         part.extend_from_slice(&bytes);
         if part.len() >= CHUNK_SIZE {
@@ -239,7 +262,7 @@ async fn multipart_upload(
             let bucket_name = bucket_name.to_string();
             let object_key = object_key.to_string();
             let upload_id = upload_id.clone();
-            let body = body.to_vec();
+            let body = body.clone();
             let task = tokio::spawn(async move {
                 upload_part(
                     &client,
@@ -277,9 +300,9 @@ async fn multipart_upload(
 
     let upload_results = futures::future::try_join_all(upload_tasks)
         .await
-        .with_context(|| format!("Failed to join upload tasks for {}", object_key))?;
+        .with_context(|| format!("Failed to join upload tasks for {object_key}"))?;
 
-    let completed_uploads: Vec<CompletedPart> = upload_results
+    let completed_uploads: Result<Vec<CompletedPart>> = upload_results
         .iter()
         .enumerate()
         .map(|(i, res)| {
@@ -288,12 +311,14 @@ async fn multipart_upload(
                 .ok()
                 .and_then(|r| r.e_tag())
                 .unwrap_or_default();
-            CompletedPart::builder()
+            let part_num = i32::try_from(i).context("Part number overflow")? + 1;
+            Ok(CompletedPart::builder()
                 .e_tag(e_tag)
-                .part_number(i as i32 + 1)
-                .build()
+                .part_number(part_num)
+                .build())
         })
         .collect();
+    let completed_uploads = completed_uploads?;
 
     client
         .complete_multipart_upload()
@@ -307,12 +332,9 @@ async fn multipart_upload(
         )
         .send()
         .await
-        .with_context(|| format!("Failed to complete multipart upload for {}", object_key))?;
+        .with_context(|| format!("Failed to complete multipart upload for {object_key}"))?;
 
-    eprintln!(
-        "Successfully completed multipart upload for: {}",
-        object_key
-    );
+    eprintln!("Successfully completed multipart upload for: {object_key}");
 
     Ok(())
 }
