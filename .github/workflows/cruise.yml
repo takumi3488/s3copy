@@ -50,11 +50,11 @@ jobs:
       issues: write
       id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
 
-      - uses: smartcrabai/cruise@36833f10063e94efee298bf3293e00019121b8ed # v1
+      - uses: smartcrabai/cruise@e599274ccea20180da858e87ef2dd497ed009d49 # v1
         with:
           providers: |
             {
